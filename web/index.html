@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ZCode Gateway</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">Z</div>
+      <div class="brand-text">
+        <strong>ZCode Gateway</strong>
+        <span>本地 API 网关</span>
+      </div>
+    </div>
+    <nav class="nav" id="nav">
+      <button class="nav-item active" data-view="overview">
+        <span class="nav-icon">▦</span><span>概览</span>
+      </button>
+      <button class="nav-item" data-view="accounts">
+        <span class="nav-icon">◎</span><span>账号</span><span class="nav-count" id="nav-account-count">0</span>
+      </button>
+      <button class="nav-item" data-view="logs">
+        <span class="nav-icon">≡</span><span>日志</span>
+      </button>
+      <button class="nav-item" data-view="settings">
+        <span class="nav-icon">⚙</span><span>设置</span>
+      </button>
+    </nav>
+    <div class="sidebar-footer">
+      <div class="status-line"><span class="dot" id="server-dot"></span><span id="server-status">连接中</span></div>
+      <div class="muted" id="sidebar-version">v-</div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div>
+        <h1 id="page-title">概览</h1>
+        <p class="subtitle" id="page-subtitle">账号、额度与请求状态</p>
+      </div>
+      <div class="topbar-actions">
+        <div class="api-chip" id="api-chip" title="Anthropic Base URL">
+          <span class="api-chip-label">API</span>
+          <code id="api-base">http://127.0.0.1:8787</code>
+          <button class="icon-btn" id="copy-api" title="复制">⧉</button>
+        </div>
+        <button class="btn" id="refresh-all">刷新</button>
+        <button class="btn ghost" id="logout">退出</button>
+      </div>
+    </header>
+
+    <section class="view" id="view-overview">
+      <div class="stat-grid">
+        <div class="stat-card">
+          <div class="stat-label">账号</div>
+          <div class="stat-value" id="stat-accounts">0</div>
+          <div class="stat-foot"><span id="stat-available">0 个可用</span></div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">今日请求</div>
+          <div class="stat-value" id="stat-requests">0</div>
+          <div class="stat-foot">仅统计成功请求</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">今日 Tokens</div>
+          <div class="stat-value" id="stat-tokens">0</div>
+          <div class="stat-foot" id="stat-token-breakdown">输入 0 · 输出 0</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">缓存命中</div>
+          <div class="stat-value" id="stat-cache">0</div>
+          <div class="stat-foot" id="stat-cache-breakdown">读取 0 · 写入 0</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <div class="card-kicker">调度说明</div>
+            <h2>多账号策略</h2>
+          </div>
+        </div>
+        <ul class="policy-list">
+          <li><strong>会话分散</strong><span>新会话在健康账号中随机分配，避免请求集中到单个账号。</span></li>
+          <li><strong>会话粘性</strong><span>同一会话固定到同一账号，直到额度耗尽、异常或粘性过期。</span></li>
+          <li><strong>并发 1</strong><span>每个账号同时只允许一个上游请求，多余请求排队等待；断链/超时会自动释放槽位。</span></li>
+          <li><strong>失败切换</strong><span>额度耗尽、401/403、429 或上游风控时解绑会话并换号重试。</span></li>
+          <li><strong>伪装与记录</strong><span>默认官方 system 前缀 + 客户端策略，覆盖 UA/身份头、丢弃客户端 beta；可切 replace 完全替换。</span></li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <div class="card-kicker">最近请求</div>
+            <h2>调用日志</h2>
+          </div>
+          <button class="btn ghost" data-go="logs">查看全部</button>
+        </div>
+        <div class="table-wrap">
+          <table class="table" id="recent-table">
+            <thead><tr><th>时间</th><th>账号</th><th>模型</th><th>状态</th><th class="num">输入</th><th class="num">缓存</th><th class="num">输出</th><th class="num">思考</th><th class="num">耗时</th><th class="num" title="从请求开始到第一个内容 token">首 Token</th><th class="num" title="从请求开始到最后一个内容 token">最后流</th><th class="num" title="输出 tokens（已包含思考）/ 首末 token 间隔">速度</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="empty small" id="recent-empty">还没有请求记录。</div>
+      </div>
+    </section>
+
+    <section class="view hidden" id="view-accounts">
+      <div class="section-head">
+        <div>
+          <h2>账号管理</h2>
+          <p class="muted">拖动排序会影响调度优先级；新会话随机分配，后续按会话 ID 粘性。</p>
+        </div>
+        <div class="section-actions">
+          <button class="btn" id="import-local">导入本机账号</button>
+          <button class="btn primary" id="add-account">添加账号</button>
+        </div>
+      </div>
+      <div class="card">
+        <div class="table-wrap">
+          <table class="table accounts-table" id="accounts-table">
+            <thead><tr><th class="w-priority">优先级</th><th>账号</th><th>模式</th><th>状态</th><th>额度</th><th>今日 Tokens</th><th>总 Tokens</th><th>请求 / 成功率</th><th>并发</th><th>最后使用</th><th class="w-actions">操作</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="empty" id="accounts-empty">
+          <div class="empty-icon">◎</div>
+          <p>还没有账号。通过浏览器登录授权，或从本机 ZCode 客户端导入。</p>
+          <button class="btn primary" id="add-account-empty">添加账号</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="view hidden" id="view-logs">
+      <div class="section-head">
+        <div>
+          <h2>请求日志</h2>
+          <p class="muted">成功请求记录 token 用量；失败请求记录上游状态与响应。</p>
+        </div>
+        <div class="section-actions">
+          <select class="input compact" id="log-status">
+            <option value="">全部状态</option>
+            <option value="ok">成功</option>
+            <option value="error">失败</option>
+          </select>
+          <select class="input compact" id="log-account">
+            <option value="">全部账号</option>
+          </select>
+          <button class="btn" id="refresh-logs">刷新</button>
+        </div>
+      </div>
+      <div class="card">
+        <div class="table-wrap">
+          <table class="table logs-table" id="logs-table">
+            <thead><tr><th>时间</th><th>账号</th><th>模型</th><th>状态</th><th class="num">输入</th><th class="num">缓存读</th><th class="num">缓存写</th><th class="num">输出</th><th class="num">思考</th><th class="num">耗时</th><th class="num" title="从请求开始到第一个内容 token">首 Token</th><th class="num" title="从请求开始到最后一个内容 token">最后流</th><th class="num" title="输出 tokens（已包含思考）/ 首末 token 间隔">速度</th><th></th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="empty" id="logs-empty">没有符合条件的日志。</div>
+      </div>
+    </section>
+
+    <section class="view hidden" id="view-settings">
+      <div class="section-head">
+        <div>
+          <h2>设置</h2>
+          <p class="muted">本地网关行为与安全选项。</p>
+        </div>
+        <button class="btn primary" id="save-settings">保存设置</button>
+      </div>
+      <div class="settings-grid">
+        <div class="card">
+          <div class="card-head"><div><div class="card-kicker">安全</div><h2>本地访问</h2></div></div>
+          <label class="field">
+            <span>代理 Token</span>
+            <div class="token-row">
+              <input class="input mono" id="setting-token" placeholder="留空则本机免鉴权" autocomplete="off" spellcheck="false">
+              <button class="btn" id="generate-token">随机生成 sk-</button>
+              <button class="btn" id="copy-token">复制</button>
+            </div>
+            <small>生成后点“保存设置”生效；客户端需带 <code>Authorization: Bearer &lt;token&gt;</code> 或 <code>x-api-key</code>。</small>
+          </label>
+          <label class="field switch-field">
+            <span><strong>保存请求/响应内容</strong><small>用于日志详情预览；关闭后只记录 token 与状态。</small></span>
+            <input type="checkbox" id="setting-bodies" class="switch">
+          </label>
+        </div>
+        <div class="card">
+          <div class="card-head"><div><div class="card-kicker">上游</div><h2>指纹与额度</h2></div></div>
+          <label class="field switch-field">
+            <span><strong>Start Plan system 指纹</strong><small>关闭后上游会返回 3012；仅用于排查。</small></span>
+            <input type="checkbox" id="setting-fingerprint" class="switch">
+          </label>
+          <label class="field">
+            <span>提示词伪装</span>
+            <select class="input" id="setting-prompt-mode">
+              <option value="append">官方前缀 + 客户端 system（推荐）</option>
+              <option value="replace">替换为官方 ZCode system</option>
+            </select>
+            <small>append 保留客户端 system 策略；replace 完全不发送客户端 system，伪装更强。</small>
+          </label>
+          <label class="field">
+            <span>UA / 身份指纹</span>
+            <select class="input" id="setting-ua">
+              <option value="zcode">ZCode 官方（推荐）</option>
+              <option value="chrome">Chrome 浏览器</option>
+              <option value="claude-code">Claude Code</option>
+            </select>
+            <small>同时覆盖 User-Agent、X-Title、X-ZCode-* 等身份头，并丢弃客户端 anthropic-beta。</small>
+          </label>
+          <label class="field">
+            <span>额度刷新间隔（秒）</span>
+            <input class="input" id="setting-quota" type="number" min="10" max="300" step="5">
+            <small>后台定时拉取套餐额度，页面每 30 秒读取一次。</small>
+          </label>
+          <div class="info-row"><span>API Base</span><code id="setting-base">-</code></div>
+          <div class="info-row"><span>版本</span><code id="setting-version">-</code></div>
+          <div class="info-row"><span>数据目录</span><code id="setting-datadir">-</code></div>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div class="modal hidden" id="modal-add">
+  <div class="modal-backdrop" data-close="modal-add"></div>
+  <div class="modal-panel">
+    <div class="modal-head">
+      <div>
+        <div class="card-kicker">添加账号</div>
+        <h2>浏览器登录授权</h2>
+      </div>
+      <button class="icon-btn" data-close="modal-add">×</button>
+    </div>
+    <div class="modal-body">
+      <div id="add-step-1">
+        <label class="field">
+          <span>账号来源</span>
+          <select class="input" id="add-provider">
+            <option value="zai">Z.ai（Start Plan / Coding Plan）</option>
+            <option value="bigmodel">BigModel</option>
+          </select>
+        </label>
+        <p class="muted">点击生成链接后，在浏览器完成登录授权。授权成功后页面会自动识别，无需手动复制。</p>
+        <button class="btn primary block" id="generate-url">生成授权链接</button>
+      </div>
+      <div id="add-step-2" class="hidden">
+        <label class="field">
+          <span>授权链接</span>
+          <div class="input-group">
+            <input class="input mono" id="auth-url" readonly>
+            <button class="btn" id="copy-auth-url">复制</button>
+            <button class="btn primary" id="open-auth-url">打开浏览器</button>
+          </div>
+        </label>
+        <div class="waiting" id="auth-waiting">
+          <span class="spinner"></span>
+          <span>等待浏览器授权完成…</span>
+        </div>
+        <div class="divider"><span>或手动粘贴回调地址</span></div>
+        <label class="field">
+          <span>回调 URL</span>
+          <textarea class="input mono" id="callback-url" rows="3" placeholder="zcode://oauth/callback?code=...&state=..."></textarea>
+          <small>如果浏览器跳到 <code>zcode://</code> 地址而页面没有自动完成，把完整地址粘贴到这里。</small>
+        </label>
+        <button class="btn block" id="submit-callback">提交回调地址</button>
+        <div class="alert error hidden" id="add-error"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="modal hidden" id="modal-activities">
+  <div class="modal-backdrop" data-close="modal-activities"></div>
+  <div class="modal-panel">
+    <div class="modal-head">
+      <div>
+        <div class="card-kicker">活动中心</div>
+        <h2 id="activities-title">当前活动</h2>
+      </div>
+      <button class="icon-btn" data-close="modal-activities">×</button>
+    </div>
+    <div class="modal-body" id="activities-body"></div>
+    <div class="modal-body hidden" id="activity-captcha-field" style="padding-top:0">
+      <label class="field">
+        <span>Aliyun 验证参数（遇到 3012 风控时填写）</span>
+        <div class="input-group">
+          <input class="input mono" id="activity-captcha" placeholder="X-Aliyun-Captcha-Verify-Param" autocomplete="off" spellcheck="false">
+          <button class="btn" id="activity-captcha-fetch">获取验证参数</button>
+        </div>
+        <small>点击「获取验证参数」会加载 Aliyun 验证；也可以从官方客户端取得后粘贴。</small>
+        <div id="aliyun-captcha-element"></div>
+        <button id="aliyun-captcha-button" type="button" style="display:none">验证</button>
+      </label>
+    </div>
+  </div>
+</div>
+
+<div class="drawer hidden" id="drawer-log">
+  <div class="drawer-backdrop" data-close="drawer-log"></div>
+  <div class="drawer-panel">
+    <div class="drawer-head">
+      <div>
+        <div class="card-kicker">请求详情</div>
+        <h2 id="log-title">-</h2>
+      </div>
+      <button class="icon-btn" data-close="drawer-log">×</button>
+    </div>
+    <div class="drawer-body" id="log-detail"></div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+<script src="/app.js"></script>
+</body>
+</html>

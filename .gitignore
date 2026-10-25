@@ -1,0 +1,35 @@
+# Build output
+/zcode-gateway.exe
+/zcode-gateway
+build/
+release/
+/dist/
+
+# Runtime data: accounts, SQLite DB, encryption key
+/data/
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.key
+accounts.json
+
+# Private protocol notes, never published
+/docs/
+
+# Local secrets / scratch files
+.env
+*.log
+cookies.txt
+_lcj.txt
+_a.json
+_accs.json
+_*.json
+_*.txt
+_*.ps1
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
