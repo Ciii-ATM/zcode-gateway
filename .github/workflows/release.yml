@@ -1,12 +1,14 @@
 name: Release
 
+# Push a tag like v1.0.0 -> builds 6 platform packages and publishes them
+# as a GitHub Release for that exact version.
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to build and release (e.g. v1.0.0)"
+        description: "Existing tag to rebuild and publish (e.g. v1.0.0)"
         required: true
         type: string
 
@@ -15,12 +17,13 @@ permissions:
 
 env:
   GO_VERSION: "1.27"
-  TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -36,6 +39,8 @@ jobs:
     name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
     needs: test
     runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
     strategy:
       fail-fast: true
       matrix:
@@ -78,6 +83,9 @@ jobs:
     name: Publish release
     needs: build
     runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -90,8 +98,6 @@ jobs:
           sha256sum zcode-gateway_* > SHA256SUMS.txt
           cat SHA256SUMS.txt
       - name: Create or update release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           VERSION="${TAG#v}"
