@@ -268,6 +268,9 @@ func (s *Server) detectActivities(ctx context.Context, acc *Account) (*ActivityS
 	}
 	planMaps := map[string]map[string]any{}
 	var campaigns []ActivityCampaign
+	// Query params must follow the account's device profile, not the host.
+	profile := s.store.EnsureProfile(acc)
+	platform := profile.Platform + "-" + profile.Arch
 	warnings := s.reportActivation(ctx, acc)
 	serverTime := time.Now().Unix()
 	var marketingOK, previewOK bool
@@ -305,7 +308,7 @@ func (s *Server) detectActivities(ctx context.Context, acc *Account) (*ActivityS
 
 	preview, _, previewErr := s.zcodeAPICall(ctx, acc, "GET", "/api/v1/zcode-plan/billing/preview", url.Values{
 		"app_version": {appVersion},
-		"platform":    {platformHeader()},
+		"platform":    {platform},
 	}, nil, nil)
 	if previewErr != nil {
 		warnings = append(warnings, "套餐资格: "+previewErr.Error())
@@ -368,7 +371,7 @@ func (s *Server) detectActivities(ctx context.Context, acc *Account) (*ActivityS
 	var captcha *ActivityCaptcha
 	if configs, _, cfgErr := s.zcodeAPICall(ctx, acc, "GET", "/api/v1/client/configs", url.Values{
 		"app_version": {appVersion},
-		"platform":    {platformHeader()},
+		"platform":    {platform},
 	}, nil, nil); cfgErr == nil {
 		cfg := activityMap(activityMap(configs["data"])["configs"])
 		if raw := activityMap(cfg["captcha"]); raw != nil {

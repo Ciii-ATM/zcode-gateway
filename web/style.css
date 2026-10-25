@@ -303,6 +303,7 @@ textarea.input { height: auto; padding: 9px 11px; resize: vertical; line-height:
 }
 
 .account-id { font-family: var(--mono); font-size: 11px; color: var(--text-3); }
+.fingerprint { font-family: var(--mono); font-size: 11px; color: var(--text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 240px; }
 .today-total { font-weight: 600; font-variant-numeric: tabular-nums; }
 .model-line { display: flex; justify-content: space-between; gap: 10px; margin-top: 3px; color: var(--text-2); font-size: 12px; }
 .model-line span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

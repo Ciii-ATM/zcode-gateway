@@ -21,6 +21,9 @@ type OAuthFlow struct {
 	RedirectURI  string    `json:"-"`
 	CreatedAt    time.Time `json:"createdAt"`
 	AccountID    string    `json:"accountId,omitempty"`
+	// Profile is the device identity used for every call of this flow; a new
+	// account inherits it so login and message traffic share one device.
+	Profile DeviceProfile `json:"-"`
 }
 
 type OAuthManager struct {
@@ -39,8 +42,9 @@ func (m *OAuthManager) Start(ctx context.Context, provider string) (*OAuthFlow, 
 		provider = "zai"
 	}
 	pollToken := randomHex(32)
+	profile := generateProfile()
 	body, _ := json.Marshal(map[string]string{"provider": provider})
-	headers := sourceHeaders("")
+	headers := sourceHeaders(profile)
 	headers["Authorization"] = "Bearer " + pollToken
 	headers["Content-Type"] = "application/json"
 	resp, err := doRequest(ctx, m.client, http.MethodPost, "https://zcode.z.ai/api/v1/oauth/cli/init", headers, body)
@@ -77,11 +81,21 @@ func (m *OAuthManager) Start(ctx context.Context, provider string) (*OAuthFlow, 
 		State:        state,
 		RedirectURI:  "zcode://oauth/callback",
 		CreatedAt:    time.Now(),
+		Profile:      profile,
 	}
 	m.mu.Lock()
 	m.flows[flow.ID] = flow
 	m.mu.Unlock()
 	return flow, nil
+}
+
+// profile returns the flow's device profile, generating one for flows created
+// before the field existed.
+func (f *OAuthFlow) profile() DeviceProfile {
+	if f.Profile.DeviceMid == "" {
+		f.Profile = generateProfile()
+	}
+	return f.Profile
 }
 
 func (m *OAuthManager) Get(flowID string) *OAuthFlow {
@@ -107,7 +121,7 @@ func (m *OAuthManager) Status(ctx context.Context, flowID string) (string, *Acco
 		return "error", nil, errors.New("oauth flow not found")
 	}
 	url := "https://zcode.z.ai/api/v1/oauth/cli/poll/" + url.PathEscape(flow.ID)
-	headers := sourceHeaders("")
+	headers := sourceHeaders(flow.profile())
 	headers["Authorization"] = "Bearer " + flow.PollToken
 	resp, err := doRequest(ctx, m.client, http.MethodGet, url, headers, nil)
 	if err != nil {
@@ -163,7 +177,7 @@ func (m *OAuthManager) HandleCallback(ctx context.Context, rawURL string) (*Acco
 	flow := m.findByState(state)
 	if flow == nil {
 		// Allow the desktop deep-link callback without a stored flow.
-		flow = &OAuthFlow{Provider: "zai", RedirectURI: "zcode://oauth/callback", State: state}
+		flow = &OAuthFlow{Provider: "zai", RedirectURI: "zcode://oauth/callback", State: state, Profile: generateProfile()}
 	}
 	// The CLI flow usually completes through the poll endpoint; try that first.
 	if flow.ID != "" {
@@ -177,7 +191,7 @@ func (m *OAuthManager) HandleCallback(ctx context.Context, rawURL string) (*Acco
 		"redirect_uri": flow.RedirectURI,
 		"state":        state,
 	})
-	headers := sourceHeaders("")
+	headers := sourceHeaders(flow.profile())
 	headers["Content-Type"] = "application/json"
 	resp, err := doRequest(ctx, m.client, http.MethodPost, "https://zcode.z.ai/api/v1/oauth/token", headers, body)
 	if err != nil {
@@ -219,18 +233,18 @@ func (m *OAuthManager) saveAccount(ctx context.Context, flow *OAuthFlow, tokenRe
 	}
 	accessToken := rawAccess
 	if provider == "zai" {
-		business, err := exchangeBusinessToken(ctx, m.client, rawAccess)
+		business, err := exchangeBusinessToken(ctx, m.client, rawAccess, flow.profile())
 		if err != nil {
 			return nil, err
 		}
 		accessToken = business
 	}
-	customer, err := fetchCustomerInfo(ctx, m.client, accessToken, provider)
+	customer, err := fetchCustomerInfo(ctx, m.client, accessToken, provider, flow.profile())
 	var project *ProjectLocation
 	if err == nil {
 		project = defaultProject(customer, provider)
 	}
-	plan, planErr := fetchCurrentPlan(ctx, m.client, zcodeJWT, nil)
+	plan, planErr := fetchCurrentPlan(ctx, m.client, zcodeJWT, sourceHeaders(flow.profile()), flow.profile())
 	mode := "start-plan"
 	planName := ""
 	planID := ""
@@ -251,7 +265,7 @@ func (m *OAuthManager) saveAccount(ctx context.Context, flow *OAuthFlow, tokenRe
 		}
 	}
 	if mode == "coding-plan" && project != nil {
-		if keyID, err := findOrCreateProjectKey(ctx, m.client, accessToken, provider, project); err == nil {
+		if keyID, err := findOrCreateProjectKey(ctx, m.client, accessToken, provider, project, flow.profile()); err == nil {
 			project.APIKeyID = keyID
 		}
 	}
@@ -273,6 +287,7 @@ func (m *OAuthManager) saveAccount(ctx context.Context, flow *OAuthFlow, tokenRe
 	}
 	acc := &Account{
 		Label:       label,
+		Profile:     &flow.Profile,
 		Provider:    provider,
 		Mode:        mode,
 		User:        user,

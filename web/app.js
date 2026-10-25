@@ -281,6 +281,7 @@ function accountRow(account, index) {
       <div style="font-weight:600">${esc(account.label)}</div>
       <div class="muted-cell ellipsis">${esc(user.email || user.id || '')}</div>
       <div class="muted-cell account-id">${esc(shortId(account.id))}</div>
+      <div class="muted-cell fingerprint" title="device_mid ${esc(account.deviceMid || '')}">${esc(fingerprintText(account))}</div>
     </td>
     <td><span class="tag">${esc(modeLabel(account.mode))}</span></td>
     <td>
@@ -312,6 +313,7 @@ function accountRow(account, index) {
     <td class="actions">
       <button class="btn" data-action="up" data-id="${esc(account.id)}" ${index === 0 ? 'disabled' : ''}>↑</button>
       <button class="btn" data-action="down" data-id="${esc(account.id)}" ${index === state.accounts.length - 1 ? 'disabled' : ''}>↓</button>
+      <button class="btn" data-action="fingerprint" data-id="${esc(account.id)}" title="重新生成设备指纹（device_mid 会变）">新指纹</button>
       <button class="btn" data-action="activities" data-id="${esc(account.id)}">活动</button>
       <button class="btn" data-action="refresh" data-id="${esc(account.id)}">刷新</button>
       ${account.status === '冷却中' || (account.modelStates || []).some((state) => state.disabled || Number(state.cooldownUntil) > nowSec) ? `<button class="btn" data-action="clear-cooldown" data-id="${esc(account.id)}">清除冷却</button>` : ''}
@@ -543,6 +545,24 @@ async function setConcurrency(id, value) {
     });
     await loadAccounts();
     toast(`并发已设为 ${value}`);
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+function fingerprintText(account) {
+  if (!account || !account.deviceMid) return '指纹未生成';
+  return `${account.platform || '?'} · ${account.osVersion || '?'} · ${account.screen || '?'} · ${shortId(account.deviceMid)}`;
+}
+
+async function rotateFingerprint(id) {
+  const account = state.accounts.find((item) => item.id === id);
+  const label = account ? account.label : id;
+  if (!window.confirm(`为“${label}”生成一套新的设备指纹？\ndevice_mid、平台、系统版本、分辨率、语言/时区都会换。`)) return;
+  try {
+    await api(`/api/accounts/${encodeURIComponent(id)}/fingerprint`, { method: 'POST' });
+    await loadAccounts();
+    toast('已生成新指纹');
   } catch (error) {
     toast(error.message, true);
   }
@@ -863,6 +883,7 @@ document.addEventListener('click', (event) => {
     if (action.dataset.action === 'toggle') toggleAccount(id);
     if (action.dataset.action === 'refresh') refreshAccount(id);
     if (action.dataset.action === 'activities') detectActivities(id);
+    if (action.dataset.action === 'fingerprint') rotateFingerprint(id);
     if (action.dataset.action === 'clear-cooldown') clearCooldown(id);
     if (action.dataset.action === 'delete') deleteAccount(id);
   }

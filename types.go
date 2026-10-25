@@ -239,4 +239,8 @@ type AccountSummary struct {
 	Usage          UsageTotals  `json:"usage"`
 	Today          TodayStats   `json:"today"`
 	HasProject     bool         `json:"hasProject"`
+	Platform       string       `json:"platform,omitempty"`
+	OSVersion      string       `json:"osVersion,omitempty"`
+	Screen         string       `json:"screen,omitempty"`
+	DeviceMid      string       `json:"deviceMid,omitempty"`
 }

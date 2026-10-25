@@ -57,7 +57,7 @@ func (s *Server) summary(acc *Account) *AccountSummary {
 	case acc.ExhaustedUntil > time.Now().Unix():
 		status = "冷却中"
 	}
-	return &AccountSummary{
+	summary := &AccountSummary{
 		ID: acc.ID, Label: acc.Label, Provider: acc.Provider, Mode: acc.Mode,
 		Priority: acc.Priority, Enabled: acc.Enabled, Status: status,
 		Concurrency: clampConcurrency(acc.Concurrency),
@@ -66,6 +66,13 @@ func (s *Server) summary(acc *Account) *AccountSummary {
 		LastUsedAt:     acc.LastUsedAt, CreatedAt: acc.CreatedAt, Usage: acc.Usage,
 		HasProject: acc.Project != nil,
 	}
+	if profile := s.store.ProfileOf(acc); profile.DeviceMid != "" {
+		summary.Platform = profile.Platform + "-" + profile.Arch
+		summary.OSVersion = profile.OSVersion
+		summary.Screen = profile.Screen
+		summary.DeviceMid = profile.DeviceMid
+	}
+	return summary
 }
 
 func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
@@ -224,9 +231,15 @@ func (s *Server) handleAccountByID(w http.ResponseWriter, r *http.Request) {
 		if body.Concurrency != nil {
 			s.store.SetConcurrency(id, *body.Concurrency)
 		}
+		if body.Enabled != nil && !*body.Enabled {
+			// Disabled is a hard failure: no session may stay pinned to it.
+			s.pool.InvalidateAccount(id)
+			s.pool.signal()
+		}
 		writeJSON(w, 200, map[string]any{"ok": true})
 	case r.Method == http.MethodDelete && action == "":
 		s.store.DeleteAccount(id)
+		s.pool.signal()
 		writeJSON(w, 200, map[string]any{"ok": true})
 	case r.Method == http.MethodPost && action == "refresh":
 		acc := s.store.GetAccount(id)
@@ -239,6 +252,14 @@ func (s *Server) handleAccountByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, 200, map[string]any{"ok": true, "account": s.summary(s.store.GetAccount(id))})
+	case r.Method == http.MethodPost && action == "fingerprint":
+		profile := s.store.RotateProfile(id)
+		if profile == nil {
+			writeError(w, 404, "account not found")
+			return
+		}
+		s.pool.signal()
+		writeJSON(w, 200, map[string]any{"ok": true, "profile": profile})
 	case r.Method == http.MethodPost && action == "clear-cooldown":
 		if !s.store.UpdateAccount(id, func(a *Account) {
 			a.ExhaustedUntil = 0
@@ -386,6 +407,23 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// dropBindingsIfAccountDead clears session bindings only for accounts that can
+// never serve again: rejected credentials, deleted, disabled or out of quota.
+// Transient failures (429, 5xx, network) keep the preference, so sessions
+// return to the account once it recovers.
+func (s *Server) dropBindingsIfAccountDead(acc *Account, authFailed bool) {
+	if acc == nil {
+		return
+	}
+	current := s.store.GetAccount(acc.ID)
+	dead := authFailed || current == nil || !current.Enabled ||
+		(current.Quota.Granted > 0 && current.Quota.Remaining <= 0)
+	if !dead {
+		return
+	}
+	s.pool.InvalidateAccount(acc.ID)
+}
+
 func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, 405, "method not allowed")
@@ -461,14 +499,14 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 					} else {
 						s.store.MarkExhausted(acc.ID, time.Now().Add(30*time.Second), err.Error())
 					}
-					s.pool.Invalidate(sessionKey, acc.ID)
-					s.pool.InvalidateAccount(acc.ID)
+					s.dropBindingsIfAccountDead(acc, false)
 				}
 				return
 			}
 			if resp.StatusCode == 200 {
 				usage, timing, respBytes, respPreview := s.writeUpstream(ctx, w, resp, stream, start)
 				s.recordLog(acc, model, stream, 200, true, time.Since(start), usage, timing, resp.Header.Get("x-request-id"), sessionKey, r, clientReqBody, respPreview, len(reqBytes), respBytes, "")
+				s.pool.TouchSession(sessionKey)
 				done = true
 				return
 			}
@@ -478,15 +516,16 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 			lastBody = data
 			retry, cooldown, reason, _ := classifyUpstream(resp.StatusCode, data)
 			if retry {
-				if resp.StatusCode == 401 || resp.StatusCode == 403 {
+				authFailed := resp.StatusCode == 401 || resp.StatusCode == 403
+				switch {
+				case authFailed:
 					s.store.MarkExhausted(acc.ID, time.Now().Add(cooldown), reason)
-				} else if model != "" {
+				case model != "":
 					s.store.RecordModelFailure(acc.ID, model, reason)
-				} else {
+				default:
 					s.store.MarkExhausted(acc.ID, time.Now().Add(cooldown), reason)
 				}
-				s.pool.Invalidate(sessionKey, acc.ID)
-				s.pool.InvalidateAccount(acc.ID)
+				s.dropBindingsIfAccountDead(acc, authFailed)
 				return
 			}
 			s.recordLog(acc, model, stream, resp.StatusCode, false, time.Since(start), Usage{}, streamTiming{}, resp.Header.Get("x-request-id"), sessionKey, r, clientReqBody, truncate(string(data), 8192), len(reqBytes), len(data), reason)

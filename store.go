@@ -417,7 +417,10 @@ func (s *Store) AddAccount(acc *Account) error {
 	if acc.Models == nil {
 		acc.Models = map[string]*UsageTotals{}
 	}
-	s.EnsureProfile(acc)
+	profile := s.EnsureProfile(acc)
+	// Persist even when the caller supplied the profile (OAuth flow), so the
+	// identity used at login is the one stored for later traffic.
+	_ = s.saveProfile(acc.ID, *profile, acc.Concurrency, acc.LastActivationDate)
 	s.accounts = append(s.accounts, acc)
 	sort.SliceStable(s.accounts, func(i, j int) bool {
 		if s.accounts[i].Priority != s.accounts[j].Priority {
@@ -447,6 +450,7 @@ func (s *Store) DeleteAccount(id string) {
 	}
 	if s.db != nil {
 		s.db.DeleteAccountProfile(id)
+		s.db.UnbindAccount(id)
 	}
 	_ = s.saveLocked()
 }
@@ -526,6 +530,13 @@ func (s *Store) Summaries() []*AccountSummary {
 		if stats == nil {
 			stats = &TodayStats{}
 		}
+		var platform, osVersion, screen, deviceMid string
+		if acc.Profile != nil {
+			platform = acc.Profile.Platform + "-" + acc.Profile.Arch
+			osVersion = acc.Profile.OSVersion
+			screen = acc.Profile.Screen
+			deviceMid = acc.Profile.DeviceMid
+		}
 		lastUsed := acc.LastUsedAt
 		if stats.LastUsed > lastUsed {
 			lastUsed = stats.LastUsed
@@ -549,6 +560,10 @@ func (s *Store) Summaries() []*AccountSummary {
 			Usage:          acc.Usage,
 			Today:          *stats,
 			HasProject:     acc.Project != nil,
+			Platform:       platform,
+			OSVersion:      osVersion,
+			Screen:         screen,
+			DeviceMid:      deviceMid,
 		})
 	}
 	return out

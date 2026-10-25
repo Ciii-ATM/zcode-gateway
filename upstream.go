@@ -90,7 +90,7 @@ func (s *Server) ensureProjectToken(ctx context.Context, acc *Account) (string, 
 	if acc.ProjectToken != "" && acc.ProjectTokenExp > time.Now().Unix()+120 {
 		return acc.ProjectToken, nil
 	}
-	token, expires, err := mintProjectToken(ctx, s.upstream, acc)
+	token, expires, err := s.mintProjectToken(ctx, acc)
 	if err != nil {
 		return "", err
 	}
@@ -157,37 +157,17 @@ func (s *Server) Forward(ctx context.Context, acc *Account, body map[string]any,
 		endpoint = override
 	}
 	stream, _ := body["stream"].(bool)
-	profile := s.store.EnsureProfile(acc)
-	osCategory := "linux"
-	if profile.Platform == "darwin" || profile.Platform == "macos" {
-		osCategory = "macos"
-	} else if profile.Platform == "win32" || profile.Platform == "windows" {
-		osCategory = "windows"
-	}
-	headers := map[string]string{
-		"Content-Type":         "application/json",
-		"Anthropic-Version":    "2023-06-01",
-		"Authorization":        "Bearer " + token,
-		"X-Api-Key":            token,
-		"User-Agent":           "ZCode/" + appVersion,
-		"X-ZCode-App-Version":  appVersion,
-		"X-Title":              "Z Code@electron",
-		"HTTP-Referer":         "https://zcode.z.ai",
-		"X-Release-Channel":    envOr("ZCODE_RELEASE_CHANNEL", "production"),
-		"X-ZCode-Agent":        "glm",
-		"X-Platform":           profile.Platform + "-" + profile.Arch,
-		"X-Os-Category":        osCategory,
-		"X-Os-Version":         profile.OSVersion,
-		"X-Device-Mid":         profile.DeviceMid,
-		"X-Client-Language":    profile.Language,
-		"X-Client-Timezone":    profile.Timezone,
-		"X-Request-Id":         randomUUID(),
-		"X-ZCode-Session-Type": "main",
-		"X-ZCode-Trace-Id":     randomUUID(),
-		"X-Query-Id":           "01" + randomHex(11),
-		"X-ZCode-Query-Source": "main_turn",
-		"X-Session-Id":         "session_" + randomHex(16),
-	}
+	headers := identityHeaders(*s.store.EnsureProfile(acc))
+	headers["Content-Type"] = "application/json"
+	headers["Anthropic-Version"] = "2023-06-01"
+	headers["Authorization"] = "Bearer " + token
+	headers["X-Api-Key"] = token
+	headers["X-Request-Id"] = randomUUID()
+	headers["X-ZCode-Session-Type"] = "main"
+	headers["X-ZCode-Trace-Id"] = randomUUID()
+	headers["X-Query-Id"] = "01" + randomHex(11)
+	headers["X-ZCode-Query-Source"] = "main_turn"
+	headers["X-Session-Id"] = "session_" + randomHex(16)
 	if stream {
 		headers["Accept"] = "text/event-stream"
 	} else {

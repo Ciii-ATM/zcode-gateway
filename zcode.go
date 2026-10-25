@@ -10,8 +10,6 @@ import (
 	"fmt"
 	fhttp "github.com/bogdanfinn/fhttp"
 	"io"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 )
@@ -119,51 +117,11 @@ func randomUUID() string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
-func readDeviceMid() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	}
-	data, err := os.ReadFile(filepath.Join(home, ".zcode", "v2", "onboarding-record.json"))
-	if err != nil {
-		return ""
-	}
-	var record struct {
-		DeviceMid string `json:"deviceMid"`
-	}
-	if json.Unmarshal(data, &record) == nil {
-		return record.DeviceMid
-	}
-	return ""
-}
-
-func sourceHeaders(deviceMid string) map[string]string {
-	if deviceMid == "" {
-		deviceMid = readDeviceMid()
-	}
-	tz := envOr("ZCODE_CLIENT_TIMEZONE", "Asia/Shanghai")
-	h := map[string]string{
-		"HTTP-Referer":        "https://zcode.z.ai",
-		"User-Agent":          "ZCode/" + appVersion,
-		"X-ZCode-App-Version": appVersion,
-		"X-Title":             "Z Code@electron",
-		"X-Release-Channel":   envOr("ZCODE_RELEASE_CHANNEL", "production"),
-		"X-Client-Language":   envOr("ZCODE_CLIENT_LANGUAGE", "zh-CN"),
-		"X-Client-Timezone":   tz,
-		"X-ZCode-Agent":       "glm",
-		"X-Platform":          platformHeader(),
-		"X-Os-Category":       osCategory(),
-		"X-Os-Version":        osVersion(),
-	}
-	if deviceMid != "" {
-		h["X-Device-Mid"] = deviceMid
-	}
-	return h
-}
-
-func platformHeader() string {
-	arch := runtimeArch()
-	return runtimeGOOS() + "-" + arch
+// sourceHeaders returns the identity headers for calls that happen before an
+// account exists (OAuth start/poll/callback). The profile is generated per
+// flow; no value is read from the host machine.
+func sourceHeaders(profile DeviceProfile) map[string]string {
+	return identityHeaders(profile)
 }
 
 func doRequest(ctx context.Context, client HTTPDoer, method, url string, headers map[string]string, body []byte) (*fhttp.Response, error) {
@@ -189,9 +147,9 @@ func readJSON(resp *fhttp.Response) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 }
 
-func exchangeBusinessToken(ctx context.Context, client HTTPDoer, raw string) (string, error) {
+func exchangeBusinessToken(ctx context.Context, client HTTPDoer, raw string, profile DeviceProfile) (string, error) {
 	body, _ := json.Marshal(map[string]string{"token": raw})
-	headers := sourceHeaders("")
+	headers := sourceHeaders(profile)
 	headers["Content-Type"] = "application/json"
 	resp, err := doRequest(ctx, client, "POST", "https://api.z.ai/api/auth/z/login", headers, body)
 	if err != nil {
@@ -216,12 +174,12 @@ func exchangeBusinessToken(ctx context.Context, client HTTPDoer, raw string) (st
 	return parsed.Data.AccessToken, nil
 }
 
-func fetchCustomerInfo(ctx context.Context, client HTTPDoer, token, provider string) (*CustomerInfo, error) {
+func fetchCustomerInfo(ctx context.Context, client HTTPDoer, token, provider string, profile DeviceProfile) (*CustomerInfo, error) {
 	origin := "https://api.z.ai"
 	if provider == "bigmodel" {
 		origin = "https://bigmodel.cn"
 	}
-	headers := sourceHeaders("")
+	headers := sourceHeaders(profile)
 	headers["Authorization"] = token
 	headers["Content-Type"] = "application/json"
 	resp, err := doRequest(ctx, client, "GET", origin+"/api/biz/customer/getCustomerInfo", headers, nil)
@@ -242,9 +200,9 @@ func fetchCustomerInfo(ctx context.Context, client HTTPDoer, token, provider str
 	return &parsed, nil
 }
 
-func fetchCurrentPlan(ctx context.Context, client HTTPDoer, zcodeJWT string, headers map[string]string) (*PlanResponse, error) {
+func fetchCurrentPlan(ctx context.Context, client HTTPDoer, zcodeJWT string, headers map[string]string, profile DeviceProfile) (*PlanResponse, error) {
 	if headers == nil {
-		headers = sourceHeaders("")
+		headers = sourceHeaders(profile)
 	}
 	headers["Authorization"] = "Bearer " + zcodeJWT
 	headers["Accept"] = "application/json"
@@ -303,14 +261,14 @@ func defaultProject(customer *CustomerInfo, provider string) *ProjectLocation {
 	}
 }
 
-func findOrCreateProjectKey(ctx context.Context, client HTTPDoer, token, provider string, project *ProjectLocation) (string, error) {
+func findOrCreateProjectKey(ctx context.Context, client HTTPDoer, token, provider string, project *ProjectLocation, profile DeviceProfile) (string, error) {
 	origin := project.Origin
 	if origin == "" {
 		origin = "https://api.z.ai"
 	}
 	base := fmt.Sprintf("%s/api/biz/v1/organization/%s/projects/%s/api_keys",
 		strings.TrimRight(origin, "/"), project.OrganizationID, project.ProjectID)
-	headers := sourceHeaders("")
+	headers := sourceHeaders(profile)
 	if provider == "zai" {
 		headers["Authorization"] = "Bearer " + token
 	} else {
@@ -361,7 +319,9 @@ func findOrCreateProjectKey(ctx context.Context, client HTTPDoer, token, provide
 	return created.APIKey, nil
 }
 
-func mintProjectToken(ctx context.Context, client HTTPDoer, acc *Account) (string, int64, error) {
+// mintProjectToken asks for a project access token using the account's own
+// device profile, so the login identity and the message identity match.
+func (s *Server) mintProjectToken(ctx context.Context, acc *Account) (string, int64, error) {
 	if acc.Project == nil {
 		return "", 0, errors.New("account has no project key location")
 	}
@@ -371,11 +331,11 @@ func mintProjectToken(ctx context.Context, client HTTPDoer, acc *Account) (strin
 	}
 	url := fmt.Sprintf("%s/api/biz/v1/organization/%s/projects/%s/api_keys/%s/access_tokens",
 		origin, acc.Project.OrganizationID, acc.Project.ProjectID, acc.Project.APIKeyID)
-	headers := sourceHeaders("")
+	headers := s.profileHeaders(acc)
 	headers["Authorization"] = "Bearer " + acc.AccessToken
 	headers["Content-Type"] = "application/json"
 	body, _ := json.Marshal(map[string]string{"clientType": "zcode", "clientVersion": appVersion})
-	resp, err := doRequest(ctx, client, "POST", url, headers, body)
+	resp, err := doRequest(ctx, s.upstream, "POST", url, headers, body)
 	if err != nil {
 		return "", 0, err
 	}

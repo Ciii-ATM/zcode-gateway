@@ -5,10 +5,10 @@
 ## 功能
 
 - **添加账号**：浏览器打开授权链接，登录完成后自动写入；也支持粘贴 `zcode://oauth/callback?...` 或 CLI 回调 URL。
-- **多账号调度池**：每个账号同时只允许 1 个上游请求；新会话随机分配，之后按会话 ID 粘性；额度耗尽、429/1113、401/403、3012 自动换号。
+- **多账号调度池**：每个账号同时只允许 1 个上游请求；新会话随机分配，之后按会话 ID 粘性；瞬时限流只在本次请求内换号（绑定保留），401/403、额度耗尽、账号禁用/删除才解绑。
 - **限流冷却**：429/1113 连续第 3 次才冻结 1 分钟，前两次只换号不冻结；账号列表可查看冷却原因并手动「清除冷却」。
 - **活动中心**：账号列表点「活动」检测当前 marketing 活动与可领取套餐，弹窗内可直接领取；领取使用账号自己的 ZCode 凭据。
-- **账号指纹**：每个账号分配独立的 Windows/macOS 桌面指纹（平台/架构/系统版本/语言/时区/屏幕/device_mid），持久化在 SQLite `account_profiles` 表，启动自动建表迁移；同一账号跨请求、跨重启保持稳定。
+- **账号指纹**：每个账号独立生成一套自洽的桌面 SKU（平台/架构/系统版本/屏幕成套绑定，语言与时区成对），`device_mid` 为全新 UUIDv4 且跨账号不重复。**完全不读取宿主机的任何信息**，程序与数据库搬到别的机器上指纹不变。持久化在 SQLite `account_profiles`，同一账号跨请求、跨重启保持稳定。屏幕只取 Retina / 1440p 及以上的桌面分辨率。
 - **单账号并发**：账号列表可为每个账号设置 1–5 个并发，默认 1；调度池按设置动态限流。
 - **模型级冷却升级**：按「账号 + 模型」统计连续失败；3 次异常冷却 1 分钟，冷却后再次 3 次且无成功升级为 10 分钟，再 3 次禁用该模型的调度（页面显示），其他模型仍可继续使用；任意成功会重置该模型状态。
 - **SQLite 自动迁移**：`account_profiles`、`model_states` 均通过代码内建表/补列自动升级，旧版本数据目录可直接启动。
@@ -21,6 +21,7 @@
 - **上游指纹**：
   - TLS/HTTP2：`tls-client` + Chrome 131 profile
   - 完整 ZCode headers：`X-ZCode-*`、`X-Request-Id`、`X-Session-Id`、`X-Query-Id` 等
+  - 所有上游调用（OAuth、billing、活动、project token、消息）统一使用该账号的指纹，没有“登录一套、消息另一套”
   - Start Plan system prompt 指纹：自动前置官方 `system[0] + system[1]` 前缀
 - **请求兼容**：Start Plan 前置指纹后，把客户端的多段 `system` 合并为一段（多段组合会触发上游 `3012`），并剥离上游不支持的 `context_management`、`thinking.display` 和 tool `strict`；SSE 流式透传。
 
@@ -101,7 +102,8 @@ Authorization: Bearer <token>
 | `ZCODE_CAPTCHA_REGION` | `cn` | captcha region |
 | `ZCODE_GATEWAY_LOG` | `1` | `0` 关闭请求日志 |
 | `ZCODE_ADMIN_PASSWORD` | 空 | 固定面板登录密码；为空则首次启动生成并打印 |
-| `ZCODE_STICKY_TTL_SEC` | `1800` | 会话粘性过期秒数 |
+| `ZCODE_STICKY_TTL_SEC` | `86400` | 会话粘性空闲过期秒数；每次成功请求后自动顺延（滑动 TTL） |
+| `ZCODE_STICKY_WAIT_MS` | `3000` | 命中粘性账号时为其排队的最长毫秒数；超时改用空闲账号，但**不改写粘性绑定** |
 | `ZCODE_REQUEST_TIMEOUT_SEC` | `600` | 单次上游请求总超时；超时自动释放账号槽位 |
 | `ZCODE_MAX_HOLD_SEC` | `600` | 账号槽位最长占用；超时 watchdog 强制释放，防止断链/卡死永久占位 |
 
@@ -120,15 +122,20 @@ Web 设置页可改：代理 Token（支持一键随机生成 `sk-` 并复制）
 
 1. 每个账号一个容量为 1 的信号量：同一账号同时只跑一个上游请求；并发请求会排队。
 2. 新会话：在健康账号中**随机**选一个（保证第一轮分散）。
-3. 后续请求：按会话键粘性到同一账号，直到该账号额度耗尽/异常，或粘性过期（默认 30 分钟）。
+3. 后续请求：按会话键优先使用绑定账号；绑定是**偏好**而不是租约：
+   - 绑定账号空闲时直接使用；忙时最多等 `ZCODE_STICKY_WAIT_MS`，超时先用其他空闲账号跑完本次请求，绑定不变，账号恢复后会话自然回落；
+   - 上游瞬时错误（`429/1113`、`5xx`、`3012`、网络错误）只影响本次请求和模型冷却，不会解绑会话；
+   - 只有硬失败（`401/403`、额度耗尽、账号被禁用/删除）才清除该账号的会话绑定；
+   - 粘性 TTL 默认 24 小时且滑动：每次成功请求后顺延，活跃会话不会过期。
 4. 会话键来源（按顺序）：
-   - `X-Session-Id`、`X-ZCode-Session-Id`、`X-OMP-Session-Id`、`X-Claude-Code-Session-Id`、`X-Conversation-Id`
+   - `X-Session-Id`、`X-ZCode-Session-Id`、`X-OMP-Session-Id`、`X-Claude-Code-Session-Id`、`X-Conversation-Id`、`X-Codex-Session-Id`、`Session-Id`、`Conversation-Id`
+   - body 顶层 `session_id` / `sessionId` / `conversation_id` / `conversationId`
    - body `metadata.session_id` / `metadata.sessionId` / `metadata.conversation_id`
    - `metadata.user_id` 里的 `session_<uuid>`（omp/Claude Code 风格）
    - 没有会话键：每个请求随机分配（不粘性）
-5. 上游返回以下情况时标记账号冷却、解绑该账号的会话并换号：
+5. 上游返回以下情况时标记账号/模型冷却并重试其他账号（会话绑定保留，除 `401/403` 等硬失败）：
    - `429` 或 `code=1113`：10 分钟
-   - `401/403`：30 分钟
+   - `401/403`：30 分钟（硬失败，清绑定）
    - `405 code=3012`：1 分钟
    - `5xx`：30 秒
 6. 其他 `4xx` 直接返回客户端，不切换。
@@ -198,6 +205,7 @@ quota.go          billing/balance、额度统计
 upstream.go       tls-client、ZCode headers、system 指纹/合并、请求字段兼容、usage 解析
 zcode.go          Z.ai/BigModel 业务接口、项目 key
 fingerprint.go    Start Plan system 指纹
+profile.go        每账号设备指纹生成/SKU 池/身份头
 web/              HTML/CSS/JS（embed）
 ```
 

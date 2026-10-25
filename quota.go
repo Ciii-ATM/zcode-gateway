@@ -54,7 +54,7 @@ func (s *Server) refreshAllQuotas(ctx context.Context) {
 func (s *Server) refreshQuota(ctx context.Context, acc *Account) error {
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
-	plan, err := fetchCurrentPlan(ctx, s.upstream, acc.ZcodeJWT, s.profileHeaders(acc))
+	plan, err := fetchCurrentPlan(ctx, s.upstream, acc.ZcodeJWT, s.profileHeaders(acc), *s.store.EnsureProfile(acc))
 	if err != nil {
 		s.store.UpdateAccount(acc.ID, func(a *Account) {
 			a.Quota.Error = err.Error()
@@ -204,6 +204,10 @@ func (s *Server) refreshQuota(ctx context.Context, acc *Account) error {
 			}
 		}
 	})
+	if quota.Granted > 0 && quota.Remaining <= 0 {
+		// Hard failure: no session can stay on an account without quota.
+		s.pool.InvalidateAccount(acc.ID)
+	}
 	return nil
 }
 

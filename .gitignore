@@ -33,3 +33,6 @@ _*.ps1
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Backup files
+*~

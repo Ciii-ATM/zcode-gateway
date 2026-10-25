@@ -6,7 +6,9 @@ import (
 	"encoding/hex"
 	"math/rand/v2"
 	"net/http"
+	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,35 +28,59 @@ type sessionLock struct {
 }
 
 type Pool struct {
-	store     *Store
-	mu        sync.Mutex
-	slots     map[string]*accountSlot
-	sessions  map[string]*sessionLock
-	wake      chan struct{}
-	stickyTTL int64
-	maxHold   time.Duration
-	inFlight  int
-	forced    int64
+	store      *Store
+	mu         sync.Mutex
+	slots      map[string]*accountSlot
+	sessions   map[string]*sessionLock
+	wake       chan struct{}
+	stickyTTL  int64
+	stickyWait time.Duration
+	maxHold    time.Duration
+	inFlight   int
+	forced     int64
+}
+
+// stickyTTLSeconds is how long an idle session keeps its preferred account.
+// The TTL slides forward on every successful request, so it only expires after
+// a full TTL without traffic.
+func stickyTTLSeconds() int64 {
+	const fallback = 86400
+	if v := envOr("ZCODE_STICKY_TTL_SEC", ""); v != "" {
+		if n, err := time.ParseDuration(v + "s"); err == nil && n > 0 {
+			return int64(n.Seconds())
+		}
+	}
+	return fallback
+}
+
+// stickyWaitMilliseconds bounds how long a request queues for its preferred
+// account before failing over to another idle account for that request only.
+func stickyWaitMilliseconds() time.Duration {
+	const fallback = 3000
+	if raw := strings.TrimSpace(os.Getenv("ZCODE_STICKY_WAIT_MS")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n >= 0 {
+			if n > 30000 {
+				n = 30000
+			}
+			return time.Duration(n) * time.Millisecond
+		}
+	}
+	return fallback * time.Millisecond
 }
 
 func NewPool(store *Store) *Pool {
-	ttl := int64(1800)
-	if v := envOr("ZCODE_STICKY_TTL_SEC", ""); v != "" {
-		if n, err := time.ParseDuration(v + "s"); err == nil {
-			ttl = int64(n.Seconds())
-		}
-	}
 	maxHold := 600 * time.Second
 	if n, err := time.ParseDuration(envOr("ZCODE_MAX_HOLD_SEC", "600") + "s"); err == nil && n > 0 {
 		maxHold = n
 	}
 	return &Pool{
-		store:     store,
-		slots:     map[string]*accountSlot{},
-		sessions:  map[string]*sessionLock{},
-		wake:      make(chan struct{}),
-		stickyTTL: ttl,
-		maxHold:   maxHold,
+		store:      store,
+		slots:      map[string]*accountSlot{},
+		sessions:   map[string]*sessionLock{},
+		wake:       make(chan struct{}),
+		stickyTTL:  stickyTTLSeconds(),
+		stickyWait: stickyWaitMilliseconds(),
+		maxHold:    maxHold,
 	}
 }
 
@@ -96,15 +122,10 @@ func slotLimit(n int) int {
 	return n
 }
 
-func (s *accountSlot) available(limit int) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.inFlight < slotLimit(limit)
-}
-
-// holdSlot takes one of the account's concurrency slots. The returned release
-// is idempotent and is also called by a watchdog after maxHold, so a stalled or
-// abandoned request can never keep the account busy forever.
+// holdSlot takes one of the account's concurrency slots, waiting for one to
+// free up. The returned release is idempotent and is also called by a watchdog
+// after maxHold, so a stalled or abandoned request can never keep the account
+// busy forever.
 func (p *Pool) holdSlot(ctx context.Context, slot *accountSlot, limit int) (func(), error) {
 	slot.mu.Lock()
 	slot.limit = slotLimit(limit)
@@ -120,7 +141,12 @@ func (p *Pool) holdSlot(ctx context.Context, slot *accountSlot, limit int) (func
 	}
 	slot.inFlight++
 	slot.mu.Unlock()
+	return p.trackSlot(slot), nil
+}
 
+// trackSlot starts in-flight accounting and the maxHold watchdog for a slot
+// whose counter the caller has already incremented.
+func (p *Pool) trackSlot(slot *accountSlot) func() {
 	var once sync.Once
 	var watchdog *time.Timer
 	release := func() {
@@ -143,11 +169,10 @@ func (p *Pool) holdSlot(ctx context.Context, slot *accountSlot, limit int) (func
 		p.mu.Unlock()
 		release()
 	})
-
 	p.mu.Lock()
 	p.inFlight++
 	p.mu.Unlock()
-	return release, nil
+	return release
 }
 
 // Acquire returns an available account and a release function. It enforces
@@ -200,8 +225,18 @@ func (p *Pool) lockSession(key string) func() {
 }
 
 func (p *Pool) acquire(ctx context.Context, sessionKey string, exclude map[string]bool, model string) (*Account, func(), error) {
-	now := time.Now().Unix()
+	// preferred is the session's bound account. It survives transient failures:
+	// a busy, cooling or excluded account only makes this request fall back, it
+	// never rewrites or drops the preference, so the session returns to it.
+	preferred := ""
+	if sessionKey != "" && p.store.db != nil {
+		if accountID, ok := p.store.db.GetBinding(sessionKey, time.Now().Unix()); ok {
+			preferred = accountID
+		}
+	}
+	waitDeadline := time.Now().Add(p.stickyWait)
 	for {
+		now := time.Now().Unix()
 		accounts := p.store.AccountsForRefresh()
 		healthy := make([]*Account, 0, len(accounts))
 		byID := map[string]*Account{}
@@ -226,19 +261,34 @@ func (p *Pool) acquire(ctx context.Context, sessionKey string, exclude map[strin
 		}
 		p.mu.Unlock()
 
-		if sessionKey != "" && p.store.db != nil {
-			if accountID, ok := p.store.db.GetBinding(sessionKey, now); ok {
-				if acc, exists := byID[accountID]; exists && !exclude[accountID] && p.healthy(acc, now) && p.store.ModelHealthy(acc.ID, model, now) {
-					slot := p.slotFor(acc)
-					release, err := p.holdSlot(ctx, slot, acc.Concurrency)
-					if err != nil {
-						return nil, nil, err
-					}
-					p.store.db.TouchBinding(sessionKey, now, p.stickyTTL)
+		if preferred != "" {
+			acc, exists := byID[preferred]
+			if !exists || !acc.Enabled || (acc.Quota.Granted > 0 && acc.Quota.Remaining <= 0) {
+				// Hard failure: the account is gone, disabled or out of quota.
+				// The preference can never come back, so start a new one.
+				p.store.db.Unbind(sessionKey)
+				preferred = ""
+			} else if !exclude[acc.ID] && p.healthy(acc, now) && p.store.ModelHealthy(acc.ID, model, now) {
+				slot := p.slotFor(acc)
+				// Wait a bounded time for the preferred account; past the budget
+				// fall through to another idle account for this request only.
+				var release func()
+				var err error
+				if budget := time.Until(waitDeadline); budget > 0 {
+					waitCtx, cancel := context.WithTimeout(ctx, budget)
+					release, err = p.holdSlot(waitCtx, slot, acc.Concurrency)
+					cancel()
+				} else {
+					release, err = p.tryHoldSlot(slot, acc.Concurrency)
+				}
+				if err == nil {
 					p.store.SetActive(acc.ID)
 					return acc, release, nil
 				}
-				p.store.db.Unbind(sessionKey)
+				if ctx.Err() != nil {
+					return nil, nil, ctx.Err()
+				}
+				// Busy or cooling: fall back for this request, keep the binding.
 			}
 		}
 
@@ -247,30 +297,44 @@ func (p *Pool) acquire(ctx context.Context, sessionKey string, exclude map[strin
 		rand.Shuffle(len(order), func(i, j int) { order[i], order[j] = order[j], order[i] })
 		for _, acc := range order {
 			slot := p.slotFor(acc)
-			if !slot.available(acc.Concurrency) {
-				continue
-			}
-			release, err := p.holdSlot(ctx, slot, acc.Concurrency)
+			// Only take a slot that is free right now; queuing is reserved for
+			// the session's own preferred account.
+			release, err := p.tryHoldSlot(slot, acc.Concurrency)
 			if err != nil {
 				continue
 			}
-			if sessionKey != "" && p.store.db != nil {
-				p.store.db.Bind(sessionKey, acc.ID, now, p.stickyTTL)
+			if sessionKey != "" && p.store.db != nil && preferred == "" {
+				p.store.db.Bind(sessionKey, acc.ID, time.Now().Unix(), p.stickyTTL)
 			}
 			p.store.SetActive(acc.ID)
 			return acc, release, nil
 		}
 
+		if ctx.Err() != nil {
+			return nil, nil, ctx.Err()
+		}
 		p.mu.Lock()
 		wake := p.wake
 		p.mu.Unlock()
 		select {
 		case <-wake:
-			continue
 		case <-ctx.Done():
 			return nil, nil, ctx.Err()
 		}
 	}
+}
+
+// tryHoldSlot takes a slot only when it is free right now.
+func (p *Pool) tryHoldSlot(slot *accountSlot, limit int) (func(), error) {
+	slot.mu.Lock()
+	slot.limit = slotLimit(limit)
+	if slot.inFlight >= slot.limit {
+		slot.mu.Unlock()
+		return nil, errNoAvailableAccount
+	}
+	slot.inFlight++
+	slot.mu.Unlock()
+	return p.trackSlot(slot), nil
 }
 
 func (p *Pool) Stats() (inFlight int, forced int64) {
@@ -279,21 +343,19 @@ func (p *Pool) Stats() (inFlight int, forced int64) {
 	return p.inFlight, p.forced
 }
 
-func (p *Pool) Invalidate(sessionKey, accountID string) {
-	if p.store.db == nil {
-		return
-	}
-	if sessionKey != "" {
-		if bound, ok := p.store.db.GetBinding(sessionKey, time.Now().Unix()); ok && bound == accountID {
-			p.store.db.Unbind(sessionKey)
-		}
-	}
-}
-
 func (p *Pool) InvalidateAccount(accountID string) {
 	if p.store.db != nil {
 		p.store.db.UnbindAccount(accountID)
 	}
+}
+
+// TouchSession slides the preference TTL forward after a successful request,
+// so an active session never expires no matter how long it runs.
+func (p *Pool) TouchSession(sessionKey string) {
+	if p.store.db == nil || sessionKey == "" {
+		return
+	}
+	p.store.db.TouchBinding(sessionKey, time.Now().Unix(), p.stickyTTL)
 }
 
 var errNoAvailableAccount = &poolError{"no available account"}
@@ -308,8 +370,15 @@ func extractSessionKey(r *http.Request, body map[string]any) string {
 	for _, name := range []string{
 		"X-Session-Id", "X-ZCode-Session-Id", "X-OMP-Session-Id",
 		"X-Claude-Code-Session-Id", "X-Conversation-Id",
+		"X-Codex-Session-Id", "Session-Id", "Conversation-Id",
+		"session_id", "conversation_id",
 	} {
 		if value := strings.TrimSpace(r.Header.Get(name)); value != "" {
+			return sessionKey(value)
+		}
+	}
+	for _, name := range []string{"session_id", "sessionId", "conversation_id", "conversationId"} {
+		if value, ok := body[name].(string); ok && strings.TrimSpace(value) != "" {
 			return sessionKey(value)
 		}
 	}
