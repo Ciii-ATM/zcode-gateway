@@ -36,6 +36,21 @@ start.cmd
 
 打开 `http://127.0.0.1:8787`，先登录管理面板。
 
+### 预编译包
+
+Release 页提供六个平台的压缩包（仅含二进制与 README）：
+
+| 平台 | 包名 |
+|---|---|
+| Windows x64 | `zcode-gateway_<version>_windows_amd64.zip` |
+| Windows ARM64 | `zcode-gateway_<version>_windows_arm64.zip` |
+| Linux x64 | `zcode-gateway_<version>_linux_amd64.tar.gz` |
+| Linux ARM64 | `zcode-gateway_<version>_linux_arm64.tar.gz` |
+| macOS Intel | `zcode-gateway_<version>_darwin_amd64.tar.gz` |
+| macOS Apple Silicon | `zcode-gateway_<version>_darwin_arm64.tar.gz` |
+
+同目录的 `SHA256SUMS.txt` 用于校验。发布由推 tag 自动触发：`git tag v1.2.3 && git push origin v1.2.3`，工作流依次执行 `go vet`、`go test`、六平台交叉编译，再创建对应版本的 Release。
+
 ## 登录
 
 面板默认强制登录：未登录时只能看到登录页，`/api/*` 全部返回 401，看不到任何账号、额度或日志，也无法操作。
